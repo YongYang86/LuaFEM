@@ -133,7 +133,7 @@ function read_lines_elements_p1q1(edges, elements, bc_id,Line)
             bc_id[tag] = cell
 
             for j=2,n_tags do
-                --do not save 2nd tag right now
+                --do not save >=2nd  tag right now
                 tag = io.read("*number")           
             end
 
@@ -174,7 +174,7 @@ end
 
 function read_mesh_from_gmsh(filename,nodes,edges,elements,bc_id)
 
-    local temp = io.input() -- save current file
+    local temp = io.input() -- save current/default file
     io.input(filename)
 
     repeat
@@ -501,11 +501,12 @@ function assemble_lumped_mass_matrix(mesh,ML)
     end     
 end
 
+--the product of (n1 x n2) matrix mm1 and (n2 x n3) matrixmm2
 function matmul(mm1,mm2,n1,n2,n3)
     local mmres={}
     for i=1,n1 do
         mmres[i]={}
-        for j=1,n2 do 
+        for j=1,n3 do
             for k=1,n2 do 
                 mmres[i][j] =  mmres[i][j]==nil and mm1[i][k]*mm2[k][j] or mmres[i][j]+mm1[i][k]*mm2[k][j]
             end
@@ -513,6 +514,21 @@ function matmul(mm1,mm2,n1,n2,n3)
     end
     return mmres
 end 
+
+function sparse_vmult(mm,vec)
+    local vecres={}
+    local row={}
+    
+    for i=1,#mm do
+        vecres[i]=0
+        row = mm[i]
+        for col,val in pairs(row) do
+            vecres[i] = vecres[i] + val*vec[col]
+        end
+    end
+
+    return vecres
+end
 
 function vecdot(vec1,vec2)
     local res
@@ -562,12 +578,15 @@ end
 
 function get_p1_fe_base(nodes,quad_point,weight)
     local shape_grad,shape_value,JxW
-    local J,invJ,detJ
+    local J,invJ,detJ,cell_point
     J,invJ,detJ = get_triangle_J(nodes)    
     shape_grad = matmul({{-1,-1},{1,0},{0,1}},invJ,3,2,2)
     shape_value= {1-quad_point[1]-quad_point[2],quad_point[1],quad_point[2]}
     JxW = 0.5*detJ*weight
-    return shape_value,shape_grad,JxW
+    cell_point={}
+    cell_point[1]=J[1][1]*quad_point[1]+J[1][2]*quad_point[2]+nodes[1][1]
+    cell_point[2]=J[2][1]*quad_point[1]+J[2][2]*quad_point[2]+nodes[1][2]
+    return shape_value,shape_grad,JxW,cell_point
 end 
 
 function assemble_stiffness_matrix_M2(mesh,ss)
@@ -675,7 +694,50 @@ function assemble_lumped_mass_matrix_M2(mesh,ml)
 end
 
 
-function main()
+function func_f(pt)
+    local x=pt[1]
+    local y=pt[2]
+    return 32*y*(1-y)+32*x*(1-x)
+end
+
+function func_solution(pt)
+    local x=pt[1]
+    local y=pt[2]
+    return 16*x*(1-x)*y*(1-y)
+end 
+
+function assemble_rhs_by_function(mesh,func,rhs)
+    local local_rhs = {}
+    local dofs,nodes,detJ,invJ,J
+    local shape_grad,shape_value,JxW
+    local f_at_p,cell_point
+    local quad,np
+    quad,np = get_quadrature_triangle("STRANG1")
+
+    set_vector(rhs,0)
+
+    for i=1,#mesh.elements do
+        dofs = mesh.elements[i]
+        nodes = {}
+        for j=1,#dofs do 
+            nodes[j] = mesh.nodes[dofs[j]]  
+        end 
+
+        local_rhs = {}
+        for ip=1,np do 
+            shape_value,shape_grad,JxW,cell_point = get_p1_fe_base(nodes,quad.points[ip],quad.weight[ip])
+            f_at_p = func(cell_point)
+            for j=1,#dofs do
+                local_rhs[j] = local_rhs[j]==nil and f_at_p*shape_value[j]*JxW or 
+                local_rhs[j]+f_at_p*shape_value[j]*JxW
+            end
+
+        end
+        add_local_vector_to_global(local_rhs,dofs,rhs)
+    end 
+end
+
+function test1()
     --global variables
 
     --local variables
@@ -685,10 +747,11 @@ function main()
     mesh.elements = {}
     mesh.bc_id = {}--begin with 0
 
+    --start time    
     start_time = os.clock()
 
     --create a mesh
-    read_mesh_from_gmsh("square128x128.msh",mesh.nodes,mesh.edges,mesh.elements,mesh.bc_id)
+    read_mesh_from_gmsh("square2x2.msh",mesh.nodes,mesh.edges,mesh.elements,mesh.bc_id)
     write_p1q1_mesh_vtk("mesh.vtk",mesh.nodes,mesh.edges,mesh.elements)
 
 
@@ -710,7 +773,7 @@ function main()
     check_matrix(MC,"mass matrix-M2: ")
 
     assemble_lumped_mass_matrix(mesh,u)
-    --write_p1q1_data_vtk("ML.vtk",mesh.nodes,mesh.edges,mesh.elements,u,"ml")
+    write_p1q1_data_vtk("ML.vtk",mesh.nodes,mesh.edges,mesh.elements,u,"ml")
     check_vector(u,"ml: ")
     assemble_lumped_mass_matrix_M2(mesh,u)
     check_vector(u,"ml-M2: ")
@@ -719,15 +782,218 @@ function main()
     assemble_stiffness_matrix_M2(mesh,MC)
     check_matrix(MC,"stiff matrix-M2: ")
     
+    --assemble right hand side
+    local rhs={}
+    for i=0,#mesh.nodes do
+        rhs[i]=0
+    end
+    assemble_rhs_by_function(mesh,func_f,rhs)
+    write_p1q1_data_vtk("rhs.vtk",mesh.nodes,mesh.edges,mesh.elements,rhs,"rhs")
+    
+    --check time
     end_time = os.clock()
     elapsed_time = end_time-start_time
     print(elapsed_time)
 
-    love.graphics.print('time elapsed: ' .. elapsed_time .. 's', 12, 32)
     return elapsed_time
 end 
 
+function func_tag_to_value(tag)
+    local value 
+    value = 0
+    if(tag == 5)then
+        value = 1
+    end
+    
+    return value
+end
 
-main(...)
+function eliminate_row(row_index,value,MM,rhs)
+    local row = MM[row_index]
+    for col_index,_ in pairs(row) do 
+        if(row_index==col_index) then
+            row[col_index] = 1
+            rhs[row_index] = value
+        else
+            rhs[col_index]=rhs[col_index]-MM[col_index][row_index]*value
+            MM[col_index][row_index] = 0
+            row[col_index] = 0
+        end
+    end 
+end
+
+function apply_bc(mesh,SS,func,rhs)
+    --avoid eliminate twice for each nodes since 
+    --bc_id is labeled for edges
+    local visited={}
+    --since bc_id begins with 0, one has to use pairs instead of ipairs
+    for tag,lines in pairs(mesh.bc_id) do 
+        if(tag ~=5) then--natural boundary condition
+            for i=1,#lines do 
+                --print(tag,i,lines[i],mesh.edges[lines[i]][1],mesh.edges[lines[i]][2])
+                if(visited[mesh.edges[lines[i]][1]]==nil) then 
+                    eliminate_row(mesh.edges[lines[i]][1],func_tag_to_value(tag),SS,rhs)
+                    visited[mesh.edges[lines[i]][1]] = 1    
+                end
+                if(visited[mesh.edges[lines[i]][2]]==nil) then 
+                    eliminate_row(mesh.edges[lines[i]][2],func_tag_to_value(tag),SS,rhs)
+                    visited[mesh.edges[lines[i]][2]] = 1    
+                end
+            end
+        end
+    end
+    
+end
+
+function initialize_vector(nn,cc)
+    local u={}
+    for i=1,nn do
+        u[i] = cc
+    end
+    return u
+end 
+
+function assign_vector(xx,bb)
+    for ind,_ in pairs (xx) do
+        xx[ind] = bb[ind]
+    end 
+end 
+
+function vector_sadd(a,u,b,v)
+    for ind,_ in pairs (u) do
+        u[ind] = a*u[ind]+b*v[ind]
+    end 
+end
+
+--xx has initial guess x0
+function solve_Axb_cg(AA,xx,bb,epsilon,max_it)
+    local res = sparse_vmult(AA,xx)
+    vector_sadd(-1,res,1,bb)
+    local rho0 = vecdot(res,res)
+    local k=1
+    local p=initialize_vector(#xx,0)
+    local beta,w,rho1,rho2,a
+    rho1 = rho0
+    rho2 = rho0
+    repeat 
+        if(k==1)then
+            assign_vector(p,res)
+        else
+            beta = rho2/rho1
+            vector_sadd(beta,p,1,res)
+        end
+        w = sparse_vmult(AA,p)
+        a = rho2/vecdot(p,w)
+        vector_sadd(1,xx,a,p)
+        vector_sadd(1,res,-a,w)
+
+        rho1 = rho2
+        rho2 = vecdot(res,res)
+        --print (rho2,rho1,rho0)
+        k = k+1
+    until (rho2<rho0*epsilon or k>max_it)
+end
+
+function get_L2_error_between_vec_and_func(mesh,uu,ff)
+       
+    local dofs,nodes,detJ,invJ,J
+    local shape_grad,shape_value,JxW
+    local f_at_p,u_at_p,cell_point
+    local quad,np
+    quad,np = get_quadrature_triangle("")
+
+    local err=0
+    
+    for i=1,#mesh.elements do
+        dofs = mesh.elements[i]
+        nodes = {}
+        for j=1,#dofs do 
+            nodes[j] = mesh.nodes[dofs[j]]  
+        end 
+
+        for ip=1,np do 
+            shape_value,shape_grad,JxW,cell_point = get_p1_fe_base(nodes,quad.points[ip],quad.weight[ip])
+            --serious error: use point in real cell
+            f_at_p = ff(cell_point)
+            
+            u_at_p = 0
+            for j=1,#dofs do
+                u_at_p = u_at_p + uu[dofs[j]]*shape_value[j]
+            end
+            
+            err = err + (f_at_p-u_at_p)*(f_at_p-u_at_p)*JxW
+        end
+    end 
+
+    return math.sqrt(err)
+end
+function test2()
+        
+    --local variables
+    local mesh = {}
+    mesh.nodes = {}
+    mesh.edges = {}
+    mesh.elements = {}
+    mesh.bc_id = {}--begin with 0
+
+    --start time
+    start_time = os.clock()
+
+    --create a mesh
+    read_mesh_from_gmsh("square512x512.msh",mesh.nodes,mesh.edges,mesh.elements,mesh.bc_id)
+    write_p1q1_mesh_vtk("mesh.vtk",mesh.nodes,mesh.edges,mesh.elements)
+
+        
+    --initialize rhs
+    local rhs={}
+    for i=1,#mesh.nodes do
+        rhs[i]=func_solution(mesh.nodes[i])
+        --rhs[i] = 0
+    end
+    write_p1q1_data_vtk("true.vtk",mesh.nodes,mesh.edges,mesh.elements,rhs,"uu")
+
+    --interpolation error    
+    local err = get_L2_error_between_vec_and_func(mesh,rhs,func_solution)
+    print(#mesh.nodes,err)
+    
+    --assemble right hand side
+    assemble_rhs_by_function(mesh,func_f,rhs)
+    write_p1q1_data_vtk("rhs.vtk",mesh.nodes,mesh.edges,mesh.elements,rhs,"rhs")
+     
+    --assemble stiffness matrix
+    local SS={}
+    initialize_matrix(mesh,SS)
+    assemble_stiffness_matrix_M2(mesh,SS)
+        
+    --apply essential boundary condition
+    --use mesh.bc_id
+    --check_matrix(SS,"stiff matrix before applying bc: ")    
+    apply_bc(mesh,SS,func_tag_to_value,rhs)
+    --check_matrix(SS,"stiff matrix after applying bc: ")
+
+    --initialize solution
+    local u={}
+    for i=1,#mesh.nodes do
+        u[i] = 0
+    end
+    --solve linear system using CG
+    solve_Axb_cg(SS,u,rhs,1e-6,1000)
+    
+    write_p1q1_data_vtk("uu.vtk",mesh.nodes,mesh.edges,mesh.elements,u,"u")
+    
+    --compute the error
+    err = get_L2_error_between_vec_and_func(mesh,u,func_solution)
+    print(#mesh.nodes,err)
+
+    --check time
+    end_time = os.clock()
+    elapsed_time = end_time-start_time
+    print(elapsed_time)
+
+    return elapsed_time
+
+end
+
+test2(...)
 
 
